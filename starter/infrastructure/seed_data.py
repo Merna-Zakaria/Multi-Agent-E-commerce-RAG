@@ -1,37 +1,45 @@
 """
 seed_data.py
 ============
-Pre-deployment script run by Udacity workspace provisioner.
-Seeds DynamoDB tables with realistic mock customer support data
-and uploads policy documents to S3 for the RAG pipeline.
+Seeds the DynamoDB tables with mock customer support data and uploads the
+policy documents to S3 for the RAG pipeline.
 
-Students do NOT run this script - it is executed during workspace setup.
+Run once after the CloudFormation stack has reached CREATE_COMPLETE:
+
+    python infrastructure/seed_data.py
+
+The script is idempotent - running it again simply rewrites the same records.
+
+The seed data is deterministic: customer and order identifiers remain stable,
+while dates are calculated relative to the day the script runs. demo.py,
+`agent_orchestrator.py test`, and the `chat` welcome table all use these orders.
 """
 
 import boto3
-import json
 import os
 import sys
 from datetime import datetime, timedelta
-import random
 
-dynamodb = boto3.resource('dynamodb', region_name=os.environ.get('AWS_REGION', 'us-east-1'))
-s3 = boto3.client('s3', region_name=os.environ.get('AWS_REGION', 'us-east-1'))
-
+AWS_REGION   = os.environ.get('AWS_REGION', 'us-east-1')
 PROJECT_NAME = os.environ.get('PROJECT_NAME', 'udacity-agentcore')
-ACCOUNT_ID = boto3.client('sts').get_caller_identity()['Account']
 
-cf_client = boto3.client('cloudformation', region_name='us-east-1')
-try:
-    stack_info = cf_client.describe_stacks(StackName="udacity-agentcore")
-    stack_id = stack_info['Stacks'][0]['StackId']
-    full_uuid = stack_id.split('/')[-1]
-    short_uuid = full_uuid.split('-')[0]
-except Exception as e:
-    print(f"Warning: Could not fetch stack UUID. Check your AWS credentials. Error: {e}")
-    stack_uuid = "unknown"
+dynamodb = boto3.resource('dynamodb', region_name=AWS_REGION)
+s3       = boto3.client('s3', region_name=AWS_REGION)
 
-POLICY_BUCKET = f"{PROJECT_NAME}-policy-docs-{ACCOUNT_ID}-{short_uuid}"
+
+def _policy_bucket() -> str:
+    """Resolve the policy-docs bucket from the CloudFormation export."""
+    cf = boto3.client('cloudformation', region_name=AWS_REGION)
+    wanted = f"{PROJECT_NAME}-PolicyBucket"
+    for page in cf.get_paginator('list_exports').paginate():
+        for export in page['Exports']:
+            if export['Name'] == wanted:
+                return export['Value']
+    sys.exit(
+        f"ERROR: CloudFormation export '{wanted}' not found in {AWS_REGION}. "
+        f"Deploy infrastructure/starter_stack.yaml as stack '{PROJECT_NAME}' first."
+    )
+
 
 # ─────────────────────────────────────────────
 # MOCK CUSTOMER DATA
@@ -48,7 +56,7 @@ CUSTOMERS = [
     },
     {
         "customer_id": "CUST-002",
-        "name": "Bob Martinez",
+        "name": "Bob Smith",
         "email": "bob@example.com",
         "tier": "Standard",
         "account_created": "2022-08-01",
@@ -57,7 +65,7 @@ CUSTOMERS = [
     },
     {
         "customer_id": "CUST-003",
-        "name": "Carol Chen",
+        "name": "Carol Davis",
         "email": "carol@example.com",
         "tier": "Premium",
         "account_created": "2020-11-20",
@@ -66,7 +74,7 @@ CUSTOMERS = [
     },
     {
         "customer_id": "CUST-004",
-        "name": "David Kim",
+        "name": "David Lee",
         "email": "david@example.com",
         "tier": "Standard",
         "account_created": "2023-01-07",
@@ -76,43 +84,50 @@ CUSTOMERS = [
 ]
 
 # ─────────────────────────────────────────────
-# MOCK ORDER DATA
+# MOCK ORDER DATA (deterministic)
 # ─────────────────────────────────────────────
-PRODUCTS = [
-    ("Wireless Headphones Pro", 149.99, "Electronics"),
-    ("Running Shoes X200", 89.99, "Footwear"),
-    ("Coffee Maker Deluxe", 79.99, "Appliances"),
-    ("Yoga Mat Premium", 34.99, "Sports"),
-    ("Smart Watch Series 5", 299.99, "Electronics"),
-    ("Backpack Explorer", 59.99, "Accessories"),
-    ("Bluetooth Speaker", 49.99, "Electronics"),
-    ("Desk Lamp LED", 29.99, "Home"),
+# (customer_id, order_id, product_name, category, price, qty, status, days_ago)
+#
+# days_ago is the age of the order on the day the script runs. The mix is
+# chosen so the RefundAgent's tier logic is exercised:
+#   CUST-001 (Premium, 60-day window): ORD-27176 is 12 days old  -> eligible
+#                                      ORD-27180 is 95 days old  -> too old
+#   CUST-002 (Standard, 30-day window): ORD-28001 is 45 days old -> too old
+#                                       ORD-28002 is 8 days old  -> eligible
+#   CUST-003 (Premium): ORD-29001 is 40 days old -> eligible only because Premium
+#   CUST-004 (Standard): ORD-30001 is 20 days old -> eligible
+ORDERS = [
+    ("CUST-001", "ORD-27176", "Wireless Headphones Pro",  "Electronics",  149.99, 1, "delivered",   12),
+    ("CUST-001", "ORD-27177", "Smart Watch Series 5",     "Electronics",  299.99, 1, "shipped",      3),
+    ("CUST-001", "ORD-27180", "Coffee Maker Deluxe",      "Appliances",    79.99, 1, "delivered",   95),
+    ("CUST-002", "ORD-28001", "Mechanical Keyboard K2",   "Electronics",   89.99, 1, "delivered",   45),
+    ("CUST-002", "ORD-28002", "Running Shoes X200",       "Footwear",      89.99, 2, "delivered",    8),
+    ("CUST-002", "ORD-28003", "Desk Lamp LED",            "Home",          29.99, 1, "processing",   1),
+    ("CUST-003", "ORD-29001", "Laptop UltraBook 14",      "Electronics", 1099.00, 1, "delivered",   40),
+    ("CUST-003", "ORD-29002", "Backpack Explorer",        "Accessories",   59.99, 1, "delivered",   70),
+    ("CUST-003", "ORD-29003", "Bluetooth Speaker",        "Electronics",   49.99, 1, "cancelled",   15),
+    ("CUST-004", "ORD-30001", "Phone Case Slim",          "Accessories",   19.99, 1, "delivered",   20),
+    ("CUST-004", "ORD-30002", "Yoga Mat Premium",         "Sports",        34.99, 1, "shipped",      2),
 ]
 
-STATUSES = ["delivered", "shipped", "processing", "cancelled", "return_requested"]
 
 def generate_orders():
+    today = datetime.now()
     orders = []
-    for customer in CUSTOMERS:
-        num_orders = random.randint(2, 5)
-        for i in range(num_orders):
-            product = random.choice(PRODUCTS)
-            order_date = datetime.now() - timedelta(days=random.randint(1, 120))
-            status = random.choice(STATUSES)
-            orders.append({
-                "customer_id": customer["customer_id"],
-                "order_id": f"ORD-{random.randint(10000, 99999)}",
-                "product_name": product[0],
-                "product_category": product[2],
-                "price": str(product[1]),
-                "quantity": str(random.randint(1, 3)),
-                "status": status,
-                "order_date": order_date.strftime("%Y-%m-%d"),
-                "estimated_delivery": (order_date + timedelta(days=5)).strftime("%Y-%m-%d"),
-                "tracking_number": f"TRK{random.randint(100000000, 999999999)}",
-                "return_eligible": str(status == "delivered" and 
-                                       (datetime.now() - order_date).days <= 30).lower()
-            })
+    for i, (cid, oid, product, category, price, qty, status, days_ago) in enumerate(ORDERS):
+        order_date = today - timedelta(days=days_ago)
+        orders.append({
+            "customer_id":        cid,
+            "order_id":           oid,
+            "product_name":       product,
+            "product_category":   category,
+            "price":              str(price),
+            "quantity":           str(qty),
+            "status":             status,
+            "order_date":         order_date.strftime("%Y-%m-%d"),
+            "estimated_delivery": (order_date + timedelta(days=5)).strftime("%Y-%m-%d"),
+            "tracking_number":    f"TRK{100000100 + i * 7919}",
+        })
     return orders
 
 # ─────────────────────────────────────────────
@@ -250,7 +265,7 @@ Last Updated: January 2025
 
 STANDARD WARRANTY
 All NovaMart products come with a 1-year limited warranty against manufacturing defects.
-Electronics carry a 2-year warranty. 
+Electronics carry a 2-year warranty.
 
 WARRANTY COVERAGE
 The warranty covers:
@@ -303,13 +318,16 @@ def seed_orders():
     for order in orders:
         table.put_item(Item=order)
     print(f"  ✓ Inserted {len(orders)} orders")
+    for o in orders:
+        print(f"    {o['customer_id']}  {o['order_id']}  {o['status']:<12} "
+              f"{o['order_date']}  {o['product_name']}")
 
 
-def upload_policy_documents():
+def upload_policy_documents(bucket: str):
     print("Uploading policy documents to S3...")
     for filename, content in POLICY_DOCUMENTS.items():
         s3.put_object(
-            Bucket=POLICY_BUCKET,
+            Bucket=bucket,
             Key=f"policies/{filename}",
             Body=content.encode('utf-8'),
             ContentType='text/plain',
@@ -318,51 +336,22 @@ def upload_policy_documents():
                 'last_updated': '2025-01'
             }
         )
-        print(f"  ✓ Uploaded {filename}")
-
-
-def create_test_user():
-    """Create a test Cognito user for student testing."""
-    cognito = boto3.client('cognito-idp', region_name=os.environ.get('AWS_REGION', 'us-east-1'))
-    
-    # Get User Pool ID from CloudFormation exports
-    cf = boto3.client('cloudformation', region_name=os.environ.get('AWS_REGION', 'us-east-1'))
-    try:
-        response = cf.list_exports()
-        exports = {e['Name']: e['Value'] for e in response['Exports']}
-        user_pool_id = exports.get(f'{PROJECT_NAME}-UserPoolId')
-        
-        if user_pool_id:
-            cognito.admin_create_user(
-                UserPoolId=user_pool_id,
-                Username='testuser@udacity.com',
-                TemporaryPassword='TempPass123!',
-                UserAttributes=[
-                    {'Name': 'email', 'Value': 'testuser@udacity.com'},
-                    {'Name': 'email_verified', 'Value': 'true'},
-                    {'Name': 'name', 'Value': 'Udacity Test User'},
-                ],
-                MessageAction='SUPPRESS'
-            )
-            print("  ✓ Created test user: testuser@udacity.com / TempPass123!")
-        else:
-            print("  ⚠ Could not find UserPoolId - skipping test user creation")
-    except Exception as e:
-        print(f"  ⚠ Test user creation skipped: {e}")
+        print(f"  ✓ Uploaded policies/{filename}")
 
 
 if __name__ == '__main__':
     print("=" * 50)
     print("Udacity AgentCore Project - Data Seeding")
     print("=" * 50)
-    
+
+    policy_bucket = _policy_bucket()
+
     seed_customers()
     seed_orders()
-    upload_policy_documents()
-    create_test_user()
-    
-    print("\n✅ Workspace seeding complete!")
-    print("\nExported resource names:")
+    upload_policy_documents(policy_bucket)
+
+    print("\n✅ Seeding complete!")
+    print("\nResource names:")
     print(f"  Orders Table:    {PROJECT_NAME}-orders")
     print(f"  Customers Table: {PROJECT_NAME}-customers")
-    print(f"  Policy Bucket:   {POLICY_BUCKET}")
+    print(f"  Policy Bucket:   {policy_bucket}")
