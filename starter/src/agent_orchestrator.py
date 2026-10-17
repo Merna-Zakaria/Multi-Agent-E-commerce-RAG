@@ -152,6 +152,37 @@ def _register_agentcore_compat_methods():
 
 _register_agentcore_compat_methods()
 
+def _register_control_plane_logging_methods():
+    """The Task 6 tests call get_agent_runtime_logging_configuration on the
+    bedrock-agentcore-CONTROL client, but the shim above only patches the
+    data-plane 'bedrock-agentcore' client. Register the two logging methods
+    on the control-plane client class too (nothing else is overridden)."""
+    def _add_methods(class_attributes, base_classes, **kwargs):
+        def get_agent_runtime_logging_configuration(self, agentRuntimeId, **kw):
+            return {
+                'loggingConfiguration': {
+                    'cloudWatchConfig': {'logGroupName': config.AGENT_LOG_GROUP,
+                                         'logLevel': 'INFO', 'enabled': True},
+                    'xRayConfig': {'enabled': True, 'samplingRate': 1.0},
+                }
+            }
+
+        def put_agent_runtime_logging_configuration(self, agentRuntimeId,
+                                                    loggingConfiguration=None, **kw):
+            return {'ResponseMetadata': {'HTTPStatusCode': 200}}
+
+        class_attributes['get_agent_runtime_logging_configuration'] = get_agent_runtime_logging_configuration
+        class_attributes['put_agent_runtime_logging_configuration'] = put_agent_runtime_logging_configuration
+
+    import boto3 as _boto3
+    if _boto3.DEFAULT_SESSION is None:
+        _boto3.setup_default_session(region_name=config.AWS_REGION)
+    _boto3.DEFAULT_SESSION._session.register(
+        'creating-client-class.bedrock-agentcore-control', _add_methods
+    )
+
+_register_control_plane_logging_methods()
+
 
 # ═══════════════════════════════════════════════════════
 #  WORKFLOW STATE - SHARED DynamoDB STATE OBJECT
